@@ -954,3 +954,29 @@ Async locks default to ``thread_local=False`` because the thread that calls ``ac
   :ref:`how-to:Force-release a lock`.
 - Using async locks? See :ref:`how-to:Use async locks`.
 - Consult :doc:`api` for complete API documentation.
+
+Fair in-process queuing
+=======================
+
+:class:`~filelock.FairFileLock` wraps any file lock with an explicit FIFO ticket queue:
+
+.. code-block:: python
+
+    from filelock import FairFileLock, FileLock
+
+    fair = FairFileLock(FileLock("work.lock"))
+
+    with fair.acquire(timeout=10):
+        pass  # entered in ticket order among this wrapper's threads
+
+Every non-reentrant ``acquire`` draws a ticket and waits for its turn before it drives the wrapped lock, so threads
+of this process are served first-come-first-served instead of racing the OS primitive. A waiter whose timeout or
+``cancel_check`` fires drops its ticket so the queue behind it keeps moving, and a failed wrapped acquire frees the
+queue head the same way. One ``acquire`` call spends a single timeout budget across the queue wait and the wrapped
+acquire. Reentry by the current holder draws no ticket and only bumps the hold count; each ``release`` undoes one
+acquisition, and the wrapped lock is released only when the count reaches zero.
+
+Fairness scope: the queue is per ``FairFileLock`` instance and orders only threads of the current process that
+acquire through this same wrapper. The wrapped lock is still acquired for real, so cross-process exclusion is never
+bypassed; other processes, other wrapper instances around the same lock file, and threads using the wrapped lock
+directly are serialized solely by the underlying lock, exactly as without the wrapper.
