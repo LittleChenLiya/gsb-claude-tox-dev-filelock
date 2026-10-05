@@ -13,7 +13,7 @@ import warnings
 from abc import ABCMeta, abstractmethod
 from collections.abc import Callable, Hashable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import count, starmap
 from threading import Condition, RLock, get_ident, local
 from typing import TYPE_CHECKING, Final, Literal, NoReturn, TypedDict, TypeVar, cast
@@ -960,12 +960,14 @@ class BaseFileLock(contextlib.ContextDecorator, metaclass=FileLockMeta):  # ruff
 
         """
         _ensure_current_process()
+        self._ensure_owner_process()
         return self._context.lock_file_fd is not None
 
     @property
     def lock_counter(self) -> int:
         """The number of times this lock has been acquired (but not yet released)."""
         _ensure_current_process()
+        self._ensure_owner_process()
         return self._context.lock_counter
 
     def __enter__(self) -> Self:
@@ -1052,6 +1054,7 @@ class BaseFileLock(contextlib.ContextDecorator, metaclass=FileLockMeta):  # ruff
             without side effects.
 
         """
+        self._ensure_owner_process()
         self._raise_if_inherited()
         if timeout is None:
             timeout = self._context.timeout
@@ -1132,6 +1135,7 @@ class BaseFileLock(contextlib.ContextDecorator, metaclass=FileLockMeta):  # ruff
         :param force: If true, the lock counter is ignored and the lock is released in every case.
 
         """
+        self._ensure_owner_process()
         # A shared instance releases under the same gate its acquisition ran through, so a thread entering the lock
         # never observes a partially torn-down owner. Only an acquirer that found the lock free holds the gate for
         # long, so an unheld lock returns without waiting behind it.
@@ -1163,11 +1167,58 @@ class BaseFileLock(contextlib.ContextDecorator, metaclass=FileLockMeta):  # ruff
             msg = f"{type(self).__name__} on {self.lock_file} was inherited across fork; construct a new instance"
             raise RuntimeError(msg)
 
+    def _ensure_owner_process(self) -> None:
+        # Explicit per-object fork ownership protection: a context copied into a forked process carries the parent's
+        # PID, so the parent's reentry count must never become the child's holding state. This does not depend on
+        # os.register_at_fork (absent on Windows); the lock object detects the identity change itself.
+        if self._context.owner_pid == os.getpid():
+            return
+        self._detach_inherited_context()
+
+    def _detach_inherited_context(self) -> None:
+        # The context was inherited across fork. Close only the descriptor copies this object holds, without calling
+        # the backend's release (which would unlock the parent's kernel lock) or unlinking the parent's marker, then
+        # zero the reentry count so the child starts from an unheld state. Never infer the parent's death from its PID.
+        if (fd := self._context.lock_file_fd) is not None:
+            self._close_inherited_fd(fd, self._context.lock_file_fd_identity)
+        if (pending_fd := self._context.pending_lock_file_fd) is not None:
+            self._close_inherited_fd(pending_fd, self._context.pending_lock_file_fd_identity)
+        self._context.lock_file_fd = None
+        self._context.lock_file_fd_token = None
+        self._context.lock_file_fd_identity = None
+        self._context.pending_lock_file_fd = None
+        self._context.pending_lock_file_fd_identity = None
+        self._context.lock_counter = 0
+        self._context.lock_file_key = None
+        self._context.lock_file_registry = None
+        self._context.owner_claim_paths = ()
+        self._context.claim_root = None
+        self._context.owner_pid = os.getpid()
+        self._transition_lock = RLock()
+
+    @staticmethod
+    def _close_inherited_fd(fd: int, identity: tuple[int, int] | None) -> None:
+        # Close an inherited descriptor only while it still names the file the context recorded, so a descriptor number
+        # reused after the parent closed it is never closed by the child. This is a plain close, not an unlock: on Unix
+        # the flock stays tied to the parent's open file description, and on Windows the inherited handle is closed
+        # without touching the byte-range lock.
+        try:
+            stat_result = os.fstat(fd)
+        except OSError:
+            return
+        if identity is not None and (stat_result.st_dev, stat_result.st_ino) != identity:
+            return
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
     def _mark_descriptor_owned(self, fd: int, identity: tuple[int, int] | None = None) -> None:
         self._context.pending_lock_file_fd = None
         self._context.pending_lock_file_fd_identity = None
         self._context.lock_file_fd = fd
         self._context.lock_file_fd_identity = identity
+        # Record the process that owns this physical hold, so a context inherited across fork can be detected and
+        # reset per object instead of trusting the parent's reentry count.
+        self._context.owner_pid = os.getpid()
 
     def _mark_descriptor_pending(self, fd: int, identity: tuple[int, int] | None = None) -> None:
         self._context.pending_lock_file_fd = fd
@@ -1531,6 +1582,10 @@ class FileLockContext:
     #: Canonical lock path resolved when an acquisition starts. A waiter polling a relative path must keep publishing
     #: into the directory it started in, even when another thread changes the working directory mid-wait.
     claim_root: str | None = None
+
+    #: PID of the process that owns the current held state. A context inherited across fork carries the parent's PID,
+    #: so a per-object identity check resets it instead of treating the parent's reentry count as the child's own.
+    owner_pid: int = field(default_factory=os.getpid)
 
 
 class ThreadLocalFileContext(FileLockContext, local):

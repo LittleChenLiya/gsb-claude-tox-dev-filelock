@@ -303,6 +303,7 @@ class BaseAsyncFileLock(BaseFileLock, metaclass=AsyncFileLockMeta):
                 lock.release()
 
         """
+        self._ensure_owner_process()
         self._raise_if_inherited()
         if timeout is None:
             timeout = self._context.timeout
@@ -480,6 +481,7 @@ class BaseAsyncFileLock(BaseFileLock, metaclass=AsyncFileLockMeta):
         :param force: If true, the lock counter is ignored and the lock is released in every case.
 
         """
+        self._ensure_owner_process()
         if self._creator_pid != os.getpid() or not self.is_locked:
             return
         async with self._transition_gate.hold():

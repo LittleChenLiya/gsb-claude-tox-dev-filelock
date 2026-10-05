@@ -500,3 +500,168 @@ def _assert_descriptor_closed(fd: int) -> NoReturn:
     except OSError as exception:
         exit_child(0 if exception.errno == EBADF else 1)
     exit_child(1)
+
+
+# ---------------------------------------------------------------------------
+# Explicit per-object fork ownership protection
+#
+# The lock object detects a process identity change itself (context.owner_pid
+# vs os.getpid()), independent of os.register_at_fork (absent on Windows). When
+# the identity changes, the inherited context is detached: only the descriptor
+# copies this object holds are closed, without calling the backend's release
+# (which would unlock the parent's kernel lock) or unlinking the parent's
+# marker, and the reentry counter is zeroed. The parent's death is never
+# inferred from its PID; the protection is purely identity-change detection.
+#
+# Strategy:
+#   * POSIX (supports os.fork): native fork verification in the child process.
+#   * All platforms (including Windows, which has no os.fork): a state fixture
+#     that simulates the identity change by mocking os.getpid to a different
+#     value. This does not claim kernel verification; it exercises the same
+#     per-object detach path a fork triggers.
+#
+# Run these tests with pytest, targeting this worktree's src (the editable install may point elsewhere):
+#   python -m pytest tests/test_fork_ownership.py -k "fork_identity" -v
+# ---------------------------------------------------------------------------
+
+
+class _IdentityLock(BaseFileLock):
+    """Fake backend tracking release (unlock) and unlink calls for fork identity tests."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.release_calls = 0
+        self.unlink_calls = 0
+
+    def _acquire(self) -> None:
+        fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+        self._mark_descriptor_owned(fd)
+
+    def _release(self) -> None:
+        self.release_calls += 1
+        fd = self._context.lock_file_fd
+        self._mark_descriptor_released()
+        self._close_released_fd(fd, default_suppresses=False)
+        self._unlink_held_marker((0, 0))
+
+    def _unlink_held_marker(self, _identity: tuple[int, int]) -> None:
+        self.unlink_calls += 1
+
+
+def test_fork_identity_resets_reentry_without_release(tmp_path: Path, mocker: MockerFixture) -> None:
+    # State fixture: simulate a fork by switching the process identity the lock object records. No os.fork is
+    # involved, so this runs on every platform (including Windows, which has no os.fork) and exercises the same
+    # per-object detach path a fork triggers. It does not claim kernel verification.
+    path = str(tmp_path / "identity.lock")
+    lock = _IdentityLock(path, is_singleton=False, thread_local=False)
+    lock.acquire()
+    lock.acquire()
+    assert lock.lock_counter == 2
+
+    # Switch the recorded process identity to a different value, as a fork would. The mock is installed after
+    # acquisition so owner_pid captures the real parent PID at acquire time.
+    mocker.patch("os.getpid", return_value=99999)
+
+    # Reading the counter triggers the per-object identity check: the inherited context is detached and the parent's
+    # reentry count must not become the child's holding state.
+    assert lock.lock_counter == 0
+    assert lock.is_locked is False
+    assert lock.release_calls == 0
+    assert lock.unlink_calls == 0
+
+    # The child's release must not unlock the parent's kernel lock or unlink the parent's marker.
+    lock.release()
+    assert lock.release_calls == 0
+    assert lock.unlink_calls == 0
+
+    # The inherited object still rejects acquisition (default interface compatibility); the child constructs a new
+    # lock object to operate under its own identity.
+    with pytest.raises(RuntimeError, match="inherited across fork"):
+        lock.acquire(timeout=0)
+    assert lock.release_calls == 0
+    assert lock.unlink_calls == 0
+
+
+@NEEDS_FORK  # pragma: needs fork
+@_FORK_WARNING
+def test_fork_identity_native_fork(tmp_path: Path) -> None:
+    # Native fork verification on platforms that support os.fork. The child detaches the inherited context without
+    # unlocking or unlinking the parent's hold; the parent's release and unlink counts stay zero.
+    path = str(tmp_path / "identity.lock")
+    lock = _IdentityLock(path, is_singleton=False, thread_local=False)
+    lock.acquire()
+    lock.acquire()
+    assert lock.lock_counter == 2
+
+    def identity_child() -> NoReturn:
+        assert lock.lock_counter == 0
+        assert lock.is_locked is False
+        lock.release()
+        exit_child(0 if (lock.release_calls, lock.unlink_calls) == (0, 0) else 1)
+
+    child_pid = fork_process(identity_child)
+    _, status = os.waitpid(child_pid, 0)
+
+    assert os.waitstatus_to_exitcode(status) == 0
+    # The parent's hold is untouched by the child's detach. The parent acquired twice, so release twice.
+    assert lock.lock_counter == 2
+    assert lock.release_calls == 0
+    assert lock.unlink_calls == 0
+    lock.release()
+    assert lock.release_calls == 0
+    assert lock.unlink_calls == 0
+    lock.release()
+    assert lock.release_calls == 1
+    assert lock.unlink_calls == 1
+
+
+class _AsyncIdentityLock(BaseAsyncFileLock):
+    """Async fake backend tracking release (unlock) and unlink calls for fork identity tests."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.release_calls = 0
+        self.unlink_calls = 0
+
+    async def _acquire(self) -> None:
+        fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+        self._mark_descriptor_owned(fd)
+
+    async def _release(self) -> None:
+        self.release_calls += 1
+        fd = self._context.lock_file_fd
+        self._mark_descriptor_released()
+        self._close_released_fd(fd, default_suppresses=False)
+        self._unlink_held_marker((0, 0))
+
+    def _unlink_held_marker(self, _identity: tuple[int, int]) -> None:
+        self.unlink_calls += 1
+
+
+def test_async_fork_identity_resets_reentry_without_release(tmp_path: Path, mocker: MockerFixture) -> None:
+    # Async state fixture: same per-object detach path as the sync test, exercised through the async acquire/release.
+    path = str(tmp_path / "identity.lock")
+    lock = _AsyncIdentityLock(path, is_singleton=False, thread_local=False)
+
+    async def exercise() -> None:
+        await lock.acquire()
+        await lock.acquire()
+        assert lock.lock_counter == 2
+
+        mocker.patch("os.getpid", return_value=99999)
+
+        assert lock.lock_counter == 0
+        assert lock.is_locked is False
+        assert lock.release_calls == 0
+        assert lock.unlink_calls == 0
+
+        await lock.release()
+        assert lock.release_calls == 0
+        assert lock.unlink_calls == 0
+
+        with pytest.raises(RuntimeError, match="inherited across fork"):
+            await lock.acquire(timeout=0)
+        assert lock.release_calls == 0
+        assert lock.unlink_calls == 0
+
+    asyncio.run(exercise())
