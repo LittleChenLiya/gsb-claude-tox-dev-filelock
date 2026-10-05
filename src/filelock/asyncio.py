@@ -480,7 +480,12 @@ class BaseAsyncFileLock(BaseFileLock, metaclass=AsyncFileLockMeta):
         :param force: If true, the lock counter is ignored and the lock is released in every case.
 
         """
-        if self._creator_pid != os.getpid() or not self.is_locked:
+        if self._creator_pid != os.getpid():
+            # The same explicit fork-ownership protection as BaseFileLock.release: detach the inherited hold
+            # instead of unlocking or unlinking the parent process's lock.
+            self._detach_inherited_hold()
+            return
+        if not self.is_locked:
             return
         async with self._transition_gate.hold():
             await self._release_serialized(force=force)
@@ -691,7 +696,10 @@ class BaseAsyncFileLock(BaseFileLock, metaclass=AsyncFileLockMeta):
     def __del__(self) -> None:
         """Release on deletion; safe to call during GC even when no event loop is running."""
         if vars(self).get("_creator_pid") != os.getpid():
-            return  # pragma: forked child
+            # A fork child owns only its inherited descriptor copies; detach them without touching the parent's lock.
+            with contextlib.suppress(Exception):
+                self._detach_inherited_hold()
+            return
         with contextlib.suppress(Exception):
             try:
                 loop = asyncio.get_running_loop()

@@ -212,6 +212,12 @@ if sys.platform == "win32":  # pragma: win32 cover
                 with suppress(OSError):
                     Path(self.lock_file).unlink()
 
+        def _close_inherited_fd(self, fd: int) -> None:
+            # LockFileEx locks a byte range per handle and the lock descriptor is opened O_NOINHERIT, so a child
+            # process never receives this handle. If one still arrives (a fork-capable CRT layer), the child closes
+            # only its own copy: the UnlockFileEx and lock-file unlink of _release would dismantle the parent's hold.
+            super()._close_inherited_fd(fd)
+
     def _open_non_reparse_fd(path: str, mode: int) -> int | None:
         """
         Open *path* for locking while refusing reparse points, bound to the handle actually locked.

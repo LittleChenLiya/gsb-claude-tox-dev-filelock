@@ -179,6 +179,12 @@ else:  # pragma: win32 no cover
             self._mark_descriptor_released()
             self._close_released_fd(fd, default_suppresses=True)
 
+        def _close_inherited_fd(self, fd: int) -> None:
+            # flock ties the lock to the open file description a fork child shares with the parent: LOCK_UN on
+            # this inherited copy would release the PARENT's lock, while closing drops only this process's own
+            # reference (the parent's descriptor keeps the lock held). A fork child closes and never unlocks.
+            super()._close_inherited_fd(fd)
+
 
 if sys.platform == "win32":  # pragma: win32 cover
     __all__ = ["UnixFileLock", "has_fcntl"]

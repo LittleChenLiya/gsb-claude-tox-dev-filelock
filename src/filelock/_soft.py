@@ -184,6 +184,11 @@ class SoftFileLock(BaseFileLock):
                 if _file_identity(os.lstat(self.lock_file)) == identity:
                     Path(self.lock_file).unlink()
 
+    def _close_inherited_fd(self, fd: int) -> None:
+        # An existence lock releases by unlinking its marker; in a fork child that unlink would delete the parent
+        # process's lock. The child closes only its inherited descriptor copy and leaves the pathname alone.
+        super()._close_inherited_fd(fd)
+
     def _windows_unlink_if_ours(self, identity: tuple[int, int]) -> None:  # pragma: win32 cover
         retry_delay = 0.001
         for attempt in range(_UNLINK_MAX_RETRIES):

@@ -1000,7 +1000,11 @@ class BaseFileLock(contextlib.ContextDecorator, metaclass=FileLockMeta):  # ruff
     def __del__(self) -> None:
         """Force-release so a dropped reference never leaks a held lock."""
         if vars(self).get("_creator_pid") != os.getpid():
-            return  # pragma: forked child
+            # A fork child owns only its inherited descriptor copies: detach them rather than release the parent
+            # process's lock. Best effort like the force-release below, since a finalizer must not raise.
+            with contextlib.suppress(Exception):
+                self._detach_inherited_hold()
+            return
         # A finalizer must not raise. A release error during garbage collection would otherwise surface as an
         # unraisable-exception warning, attributed to whichever code triggered collection. The dropped lock still gets
         # best-effort cleanup; an explicit release() reports the same error to a caller who can act on it.
@@ -1138,7 +1142,12 @@ class BaseFileLock(contextlib.ContextDecorator, metaclass=FileLockMeta):  # ruff
         if self._context.lock_file_fd is None:
             return
         with contextlib.nullcontext() if self._is_thread_local else self._transition_lock:
-            if self._creator_pid != os.getpid() or not self.is_locked:
+            if self._creator_pid != os.getpid():
+                # Explicit fork-ownership protection: the inherited hold belongs to the parent process, so this
+                # process detaches its inherited copies instead of releasing the parent's lock.
+                self._detach_inherited_hold()
+                return
+            if not self.is_locked:
                 return
             if not force and self._context.lock_counter > 1:
                 self._context.lock_counter -= 1
@@ -1192,6 +1201,44 @@ class BaseFileLock(contextlib.ContextDecorator, metaclass=FileLockMeta):  # ruff
         self._context.lock_counter = 0
         self._context.lock_file_key = None
         self._context.lock_file_registry = None
+
+    def _detach_inherited_hold(self) -> None:
+        """
+        Drop a hold inherited across fork without touching the parent process's lock.
+
+        A lock object that notices a process identity change outside the ``os.register_at_fork`` hooks (a platform
+        without them, or a fork that bypassed them) must not treat the inherited state as its own: the reentrant
+        counter counts the parent's holds, and the backend's ``_release`` would unlock or unlink the parent's
+        lock. What this process owns is only its inherited descriptor copies, so close exactly those and reset to
+        the fresh, unheld state a newly constructed instance would have. ``acquire`` on this inherited object
+        keeps raising, leaving acquisition to a new instance per the documented rule. The parent's liveness is
+        never probed: what a child may close follows from fork semantics, not from guessing whether the parent
+        died.
+        """
+        if (token := self._context.lock_file_fd_token) is not None:  # pragma: needs fork
+            # Unregistering walks the fork-transition gate, which lazily resets module-level fork state as well.
+            _unregister_owned_descriptor(token)
+        self._close_inherited_descriptors()
+        self._drop_registry_entry()
+        self._reset_after_fork_in_child()
+
+    def _close_inherited_descriptors(self) -> None:
+        # Both context slots can hold an inherited copy: the held lock, and a descriptor opened by an acquisition
+        # that was in flight when the fork happened.
+        for fd in (self._context.lock_file_fd, self._context.pending_lock_file_fd):
+            if fd is not None:
+                self._close_inherited_fd(fd)
+
+    def _close_inherited_fd(self, fd: int) -> None:  # ruff:ignore[no-self-use]  # backends override this instance hook
+        """
+        Close this process's own inherited copy of a lock descriptor, best effort.
+
+        The copy belongs to this process, so closing it is always safe; what a backend must never do here is its
+        ``_release`` unlock or unlink, which would tear down the parent process's lock. Each backend overrides
+        this to state its own inheritance contract.
+        """
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
     def _descriptors_for_fork(self) -> tuple[tuple[int, tuple[int, int] | None], ...]:  # pragma: needs fork
         descriptors: list[tuple[int, tuple[int, int] | None]] = []
