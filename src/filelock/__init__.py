@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Final
 from ._api import AcquireReturnProxy, BaseFileLock, CloseErrorPolicy, ContextErrorPolicy, LockOptions
 from ._descriptor import lock_descriptor, unlock_descriptor
 from ._error import LeaseSettingsMismatch, SoftFileLockLifetimeWarning, SoftFileLockProtocolError, Timeout
+from ._fair import FairFileLock
 from ._lease import LeaseCompromise, SoftFileLease
 from ._marker import MarkerSoftFileLock, OwnerRecord
 
@@ -91,6 +92,7 @@ __all__ = [
     "BaseFileLock",
     "CloseErrorPolicy",
     "ContextErrorPolicy",
+    "FairFileLock",
     "FileLock",
     "LeaseCompromise",
     "LeaseSettingsMismatch",

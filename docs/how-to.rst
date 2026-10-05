@@ -387,6 +387,37 @@ If you need one lock instance shared across threads (and reentrant per thread), 
     lock = FileLock("work.lock", thread_local=False)
     # Now the lock is reentrant across threads, not per-thread
 
+************************************
+ Make in-process acquisition fair
+************************************
+
+A shared lock (``thread_local=False``) lets threads contend, but the order in which waiting threads wake up is not
+guaranteed by the OS. If you need FIFO ordering within one process, wrap the lock in :class:`FairFileLock
+<filelock.FairFileLock>`:
+
+.. code-block:: python
+
+    from filelock import FairFileLock, FileLock
+
+    lock = FairFileLock(FileLock("work.lock", thread_local=False))
+
+Threads that contend on the wrapper take numbered tickets and are served in ticket order. The served thread then
+acquires the underlying cross-process lock, so cross-process mutual exclusion is preserved and never bypassed. A
+reentrant acquire by the thread that already holds the wrapper only increments the depth and takes no new ticket.
+
+The whole acquisition shares one timeout budget: the deadline is computed once when ``acquire`` is entered and covers
+both the ticket wait and the underlying lock wait. Giving up while waiting (timeout or cancellation) removes the
+ticket; a failed underlying acquisition also advances the queue head so the next ticket can proceed. Each
+``acquire`` returns a handle that releases exactly that acquisition's depth on exit.
+
+.. code-block:: python
+
+    with lock:
+        lock.acquire()  # reentrant, depth 2, no new ticket
+
+Fairness scope: FIFO ordering is guaranteed only among threads of the *same process* using the same wrapper instance.
+Across processes the underlying file lock's own ordering applies and is not changed by this wrapper.
+
 *********************
  Use singleton locks
 *********************
